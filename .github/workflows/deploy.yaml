@@ -1,0 +1,124 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+  
+  # Trigger the workflow everytime the build workflow ran to completion
+  workflow_run:
+   workflows:
+     - Build
+   types:
+     - completed
+  
+  # Triggers when an environment file has been changed  
+  push:
+    paths:
+      - ".github/environments/environments.yaml"
+      - ".github/workflows/deploy.yaml"
+
+jobs:
+  build_environment_matrix:
+    name: 'Evaluate and initate deployments'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Install yq
+        run: |
+          sudo wget -O /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.5.0/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Get yaml to matrix
+        id: check_environment_files
+        run: |
+          echo "::set-output name=AZURE_ENVIRONMENTS::"$(yq e '{"include": .}' ./.github/environments/environments.yaml -j)""
+
+      - name: Echo output to log
+        run: |
+          echo $AZURE_ENVIRONMENTS
+
+    outputs:
+      matrix: ${{ steps.check_environment_files.outputs.AZURE_ENVIRONMENTS }}
+
+  deploy_bundle:
+    name: 'Deploy bundle'
+    needs: build_environment_matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.build_environment_matrix.outputs.matrix) }}
+    steps:
+      - name: Write output to log
+        run: |
+          echo "Deploying ${{ matrix.deploys.version }} to ${{ matrix.name }} in ${{ matrix.config.AZURE_LOCATION }}"
+  
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Setup Porter
+        uses: getporter/gh-action@v0.1.3
+
+      - name: Login to GitHub Packages OCI Registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.PACKAGE_ADMIN }}
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }} 
+
+      - name: Get incoming bundle digest
+        run: |
+          REPOSITORY=$(echo "${{ github.repository }}" | awk '{print tolower($0)}' )
+          echo BUNDLE_DIGEST_INCOMING=$(porter inspect --reference ghcr.io/$REPOSITORY:${{ matrix.deploys.version }} -o yaml | awk '$1 == "contentDigest:" {print $2}') >> $GITHUB_ENV
+
+      - name: Get incoming config digest
+        run: |
+          echo CONFIG_DIGEST_INCOMING=$(echo -n "${{ toJSON(matrix.config) }}" | sha256sum) >> $GITHUB_ENV
+
+      - name: Get deployed bundle digest
+        run: |
+          RG_NAME='rg-dotnetwebapi-${{ matrix.config.RESOURCE_NAME_PREFIX }}-${{ matrix.config.ENVIRONMENT_NAME_PREFIX }}'
+          echo BUNDLE_DIGEST_DEPLOYED=$(az group show --name $RG_NAME | jq .tags.bundle_digest -r) >> $GITHUB_ENV
+
+      - name: Get deployed config digest
+        run: |
+          RG_NAME='rg-dotnetwebapi-${{ matrix.config.RESOURCE_NAME_PREFIX }}-${{ matrix.config.ENVIRONMENT_NAME_PREFIX }}'
+          echo CONFIG_DIGEST_DEPLOYED=$(az group show --name $RG_NAME | jq .tags.config_digest -r) >> $GITHUB_ENV
+
+      - name: Output digests to compare to log
+        run: |
+          echo Bundle digest:
+          echo  - deployed: $BUNDLE_DIGEST_DEPLOYED
+          echo  - incoming: $BUNDLE_DIGEST_INCOMING
+          echo Config digest:
+          echo  - deployed: $CONFIG_DIGEST_DEPLOYED
+          echo  - incoming: $CONFIG_DIGEST_INCOMING
+          [[ (env.BUNDLE_DIGEST_DEPLOYED == env.BUNDLE_DIGEST_INCOMING) && (env.CONFIG_DIGEST_DEPLOYED == env.CONFIG_DIGEST_INCOMING) ]] && DEPLOYMENT_NECESSARY=false || DEPLOYMENT_NECESSARY=true
+          echo DEPLOYMENT_NECESSARY="$DEPLOYMENT_NECESSARY" >> $GITHUB_ENV
+
+      - name: Nothing to update
+        if: ${{ env.DEPLOYMENT_NECESSARY == 'false' }}
+        run: |
+          echo "Environment already up to date"
+
+      - name: Install
+        if: ${{ env.DEPLOYMENT_NECESSARY == 'true' }}
+        run: |
+          REPOSITORY=$( echo "${{ github.repository }}" | awk '{print tolower($0)}' )
+          porter install --tag ghcr.io/$REPOSITORY:${{ matrix.deploys.version }} --cred ./creds.json --parameter-set ./params.json
+        working-directory: ./src/bundle
+        env:
+          LOCATION: ${{ matrix.config.AZURE_LOCATION }}
+          RESOURCE_NAME_PREFIX: ${{ matrix.config.RESOURCE_NAME_PREFIX }}
+          ENVIRONMENT_NAME_PREFIX: ${{ matrix.config.ENVIRONMENT_NAME_PREFIX }}
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Update tag
+        if: ${{ env.DEPLOYMENT_NECESSARY == 'true' }}
+        run: |
+          az group update --name 'rg-dotnetwebapi-${{ matrix.config.RESOURCE_NAME_PREFIX }}-${{ matrix.config.ENVIRONMENT_NAME_PREFIX }}' --tags bundle_digest="${{ env.BUNDLE_DIGEST_INCOMING }}" config_digest="${{ env.CONFIG_DIGEST_INCOMING}}"

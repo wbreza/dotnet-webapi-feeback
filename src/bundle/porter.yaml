@@ -1,0 +1,113 @@
+name: __github_repo_name
+version: __app_version
+description: 'Porter bundle for the webapi-dotnet Azure App Accelerator: https://github.com/varaderoproject/webapi-dotnet'
+dockerfile: Dockerfile.tmpl
+registry: ghcr.io/__github_username
+
+parameters:
+  - name: LOCATION
+    type: string
+    description: 'Azure region for the resource group and resources'
+  - name: RESOURCE_NAME_PREFIX
+    type: string
+    description: 'Name prefix for Azure resources'
+  - name: ENVIRONMENT_NAME_PREFIX
+    type: string
+    description: 'Name prefix for Azure resources'
+
+credentials:
+  - name: AZURE_CREDENTIALS
+    env: AZURE_CREDENTIALS
+
+mixins:
+  - az
+  - exec
+
+install:
+  - exec:
+      description: 'Extracting deployment parameters...'
+      command: ./utils.sh
+      arguments:
+        - echo-azure-credentials
+      outputs:
+        - name: 'CLIENT_ID'
+          jsonPath: '$.clientId'
+        - name: 'CLIENT_SECRET'
+          jsonPath: '$.clientSecret'
+        - name: 'TENANT_ID'
+          jsonPath: '$.tenantId'
+        - name: 'SUBSCRIPTION_ID'
+          jsonPath: '$.subscriptionId'
+
+  - az:
+      description: 'Logging into Azure...'
+      arguments:
+        - login
+      flags:
+        service-principal:
+        username: '{{ bundle.outputs.CLIENT_ID }}'
+        password: '{{ bundle.outputs.CLIENT_SECRET }}'
+        tenant: '{{ bundle.outputs.TENANT_ID }}'
+        output: table
+
+  - az:
+      description: 'Setting subscription...'
+      arguments:
+        - account
+        - set
+      flags:
+        subscription: '{{ bundle.outputs.SUBSCRIPTION_ID }}'
+
+  - exec:
+      description: 'Deploying the application...'
+      command: ./dev-deploy.sh
+      arguments:
+        - --no-build
+        - '{{ bundle.parameters.RESOURCE_NAME_PREFIX }}'
+        - '{{ bundle.parameters.ENVIRONMENT_NAME_PREFIX }}'
+        - '{{ bundle.parameters.LOCATION }}'
+
+
+uninstall:
+  - exec:
+      description: 'Extracting deployment parameters...'
+      command: ./utils.sh
+      arguments:
+        - echo-azure-credentials
+      outputs:
+        - name: 'CLIENT_ID'
+          jsonPath: '$.clientId'
+        - name: 'CLIENT_SECRET'
+          jsonPath: '$.clientSecret'
+        - name: 'TENANT_ID'
+          jsonPath: '$.tenantId'
+        - name: 'SUBSCRIPTION_ID'
+          jsonPath: '$.subscriptionId'
+
+  - az:
+      description: 'Logging into Azure...'
+      arguments:
+        - login
+      flags:
+        service-principal:
+        username: '{{ bundle.outputs.CLIENT_ID }}'
+        password: '{{ bundle.outputs.CLIENT_SECRET }}'
+        tenant: '{{ bundle.outputs.TENANT_ID }}'
+        output: table
+
+  - az:
+      description: 'Setting subscription...'
+      arguments:
+        - account
+        - set
+      flags:
+        subscription: '{{ bundle.outputs.SUBSCRIPTION_ID }}'
+
+  - exec:
+      description: 'Uninstalling the application...'
+      command: ./dev-deploy.sh
+      arguments:
+        - --no-build
+        - --uninstall
+        - '{{ bundle.parameters.RESOURCE_NAME_PREFIX }}'
+        - '{{ bundle.parameters.ENVIRONMENT_NAME_PREFIX }}'
